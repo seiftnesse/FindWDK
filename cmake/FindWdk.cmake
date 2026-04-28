@@ -163,9 +163,9 @@ function(wdk_add_driver _target)
 
     target_link_libraries(${_target} WDK::NTOSKRNL WDK::HAL WDK::WMILIB)
 
-    if(WDK::BUFFEROVERFLOWK)
-        target_link_libraries(${_target} WDK::BUFFEROVERFLOWK) # to support Windows 7 and Vista
-    else()
+    if(WDK_WINVER LESS "0x0602") # If WINVER < 0x0602 (Windows 7 or lower)
+        target_link_libraries(${_target} WDK::BUFFEROVERFLOWK)
+    else() # Windows 8 and above
         target_link_libraries(${_target} WDK::BUFFEROVERFLOWFASTFAILK)
     endif()
 
