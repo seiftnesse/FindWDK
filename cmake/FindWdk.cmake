@@ -34,6 +34,11 @@
 #   target_link_libraries(KmdfCppDriver KmdfCppLib)
 #
 
+# Stash this file's directory so wdk_add_driver can locate the smoke-check
+# script regardless of where it's called from.  CMAKE_CURRENT_FUNCTION_LIST_DIR
+# would be cleaner but it requires CMake 3.17.
+set(_WDK_FINDWDK_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
 if(DEFINED ENV{WDKContentRoot})
     file(GLOB WDK_NTDDK_FILES
         "$ENV{WDKContentRoot}/Include/*/km/ntddk.h" # WDK 10
@@ -90,68 +95,58 @@ set(WDK_NTDDI_VERSION "" CACHE STRING "Specified NTDDI_VERSION for WDK targets i
 set(WDK_ADDITIONAL_FLAGS_FILE "${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/wdkflags.h")
 file(WRITE ${WDK_ADDITIONAL_FLAGS_FILE} "#pragma runtime_checks(\"suc\", off)")
 
-if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
-    # Force-included shim that papers over two gaps in clang's MSVC
-    # kernel-intrinsic support:
-    #   1. clang < 20.1.0 declared __readcr4/__readcr8/__writecr4/__writecr8
-    #      with `unsigned long` instead of ULONG64, conflicting with wdm.h.
-    #      Fix landed via https://github.com/llvm/llvm-project/pull/122238.
-    #   2. _disable, _enable, __readcr0, __writecr0 are declared in
-    #      <intrin.h> but never inlined to instructions, so the linker hits
-    #      undefined symbols on KM code that uses them.
-    # Strategy: macro-rename clang's broken/missing-body decls aside, then
-    # provide our own static-inline asm bodies on the canonical names.
-    set(WDK_CLANG_COMPAT_FILE "${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/wdk_clang_compat.h")
-    set(_wdk_shim_contents "")
-    string(APPEND _wdk_shim_contents
-"#ifdef __clang__\n"
-"/* Hide clang's intrin.h decls (wrong types pre-20.1.0 and/or no body) so\n"
-" * wdm.h's prototypes are unchallenged; provide inline-asm bodies below. */\n"
-"#define _disable   __wdk_unused_clang_disable\n"
-"#define _enable    __wdk_unused_clang_enable\n"
-"#define __readcr0  __wdk_unused_clang_readcr0\n"
-"#define __readcr4  __wdk_unused_clang_readcr4\n"
-"#define __readcr8  __wdk_unused_clang_readcr8\n"
-"#define __writecr0 __wdk_unused_clang_writecr0\n"
-"#define __writecr4 __wdk_unused_clang_writecr4\n"
-"#define __writecr8 __wdk_unused_clang_writecr8\n"
-"#include <intrin.h>\n"
-"#undef _disable\n"
-"#undef _enable\n"
-"#undef __readcr0\n"
-"#undef __readcr4\n"
-"#undef __readcr8\n"
-"#undef __writecr0\n"
-"#undef __writecr4\n"
-"#undef __writecr8\n"
-"#ifdef __cplusplus\n"
-"extern \"C\" {\n"
-"#endif\n"
-"#define _WDK_DEF_RDCR(N) static __forceinline unsigned __int64 __readcr##N(void) { unsigned __int64 v; __asm__ __volatile__(\"movq %%cr\" #N \", %0\" : \"=r\"(v)); return v; }\n"
-"#define _WDK_DEF_WRCR(N) static __forceinline void __writecr##N(unsigned __int64 v) { __asm__ __volatile__(\"movq %0, %%cr\" #N :: \"r\"(v)); }\n"
-"static __forceinline void _disable(void) { __asm__ __volatile__(\"cli\" ::: \"memory\"); }\n"
-"static __forceinline void _enable(void)  { __asm__ __volatile__(\"sti\" ::: \"memory\"); }\n"
-"_WDK_DEF_RDCR(0) _WDK_DEF_RDCR(4) _WDK_DEF_RDCR(8)\n"
-"_WDK_DEF_WRCR(0) _WDK_DEF_WRCR(4) _WDK_DEF_WRCR(8)\n"
-"#undef _WDK_DEF_RDCR\n"
-"#undef _WDK_DEF_WRCR\n"
-"#ifdef __cplusplus\n"
-"}\n"
-"#endif\n"
-"#endif\n")
-    file(WRITE ${WDK_CLANG_COMPAT_FILE} "${_wdk_shim_contents}")
+set(WDK_SECURITY_COOKIE_FILE "")
+set(WDK_MEM_FUNCS_FILE "")
+set(WDK_CLANG_COMPAT_FILE "")
 
-    # clang-cl has no /kernel; approximate it: SIMD off (xmm/ymm in KM
-    # require explicit Ke{Save,Restore}FloatingPointState), security
-    # cookie + stack probes off (KM has no __chkstk / __security_cookie).
+if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    # Three shims live as plain .c / .h files alongside this module.
+    # See each file's header comment for the BSOD it prevents.  Using
+    # physical files instead of file(WRITE ...) keeps them readable,
+    # lintable, and trivially diff-able when something needs to change.
+    set(WDK_SECURITY_COOKIE_FILE "${_WDK_FINDWDK_DIR}/wdk_security_cookie.c")
+    set(WDK_MEM_FUNCS_FILE       "${_WDK_FINDWDK_DIR}/wdk_mem_funcs.c")
+    set(WDK_CLANG_COMPAT_FILE    "${_WDK_FINDWDK_DIR}/wdk_clang_compat.h")
+
+    # clang-cl has no /kernel.  Defence is layered:
+    #
+    # 1. -mgeneral-regs-only (compiler) — covers every clang-emitted code
+    #    path that could touch xmm/ymm/zmm: direct __m128 use, vectorizer
+    #    output, ABI float lowerings, inline expansions of small mem*.
+    #    Verified to work on x86 in clang 19 (LLVM D103943, shipped in
+    #    clang 13+).  Replaces the older -mno-sse*/-mno-avx*/-mno-mmx/
+    #    -mno-implicit-float/-fno-vectorize/-fno-slp-vectorize/
+    #    -fno-builtin-mem* zoo.
+    #
+    # 2. wdk_mem_funcs.c (linker)       — `-mgeneral-regs-only` is a
+    #    COMPILER flag.  The LINKER still has to resolve `call memcpy`
+    #    etc., and confirmed via /MAP that under lld-link they resolve
+    #    to `ntoskrnl.lib:memcpy.obj` — Microsoft ships ntoskrnl.lib
+    #    with an SSE-using static implementation (uses _mm_stream_ps /
+    #    _mm_prefetch / _mm_sfence / __m128) alongside the import stub.
+    #    lld-link prefers the static impl, so client `memcpy` calls
+    #    pull SSE into the .sys.  Our own non-SSE implementation in
+    #    wdk_mem_funcs.c overrides ntoskrnl's via selectany so the
+    #    final binary contains only `rep movsb`/`stosb`.
+    #
+    # 3. wdk_smoke_check_no_sse.cmake (post-build) — hard-fail check
+    #    that scans the .sys for any xmm/ymm/zmm reference.  Last-line
+    #    defence if either layer above ever stops working.
+    #
+    # `/clang:` prefix is required: clang-cl's MSVC-style driver doesn't
+    # accept bare `-mgeneral-regs-only` and silently DROPS it.
     set(WDK_COMPILE_FLAGS
         "/Zp8" "/GF" "/GR-" "/Gz" "/Oi"
         "/GS-" "/Gs999999"
         "/FIwarning.h"
-        -mno-sse -mno-sse2 -mno-sse3 -mno-ssse3
-        -mno-sse4.1 -mno-sse4.2
-        -mno-avx -mno-avx2 -mno-avx512f
-        -mno-mmx -mno-aes -mno-pclmul -mno-fma
+        # /Zl strips clang-cl's auto-emitted /DEFAULTLIB:msvcrtd.lib and
+        # /DEFAULTLIB:oldnames.lib directives from .obj `.drectve`
+        # sections — keeps the link surface minimal and explicit.
+        # (Note: /Zl alone does NOT remove the SSE memmove problem —
+        # that comes from ntoskrnl.lib's static memcpy.obj, see
+        # wdk_mem_funcs.c.)
+        "/Zl"
+        /clang:-mgeneral-regs-only
         -Wno-unused-command-line-argument
     )
     list(APPEND WDK_COMPILE_FLAGS "/FI${WDK_CLANG_COMPAT_FILE}")
@@ -197,6 +192,36 @@ string(CONCAT WDK_LINK_FLAGS
     "/VERSION:10.0 " #
     )
 
+if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    # clang-cl is paired with lld-link by default; lld-link diverges from
+    # MSVC link.exe in several ways that need explicit fix-ups for KM.
+    # Each line below is gated to clang only so the MSVC build path stays
+    # bit-for-bit identical to its historical output.
+    string(APPEND WDK_LINK_FLAGS
+        # /SECTION attributes REPLACE .obj-supplied flags (per linker docs).
+        # ',d' alone strips EXECUTE+READ+NOT_PAGED from INIT, so GsDriverEntry
+        # (linked from bufferoverflowfastfailk.lib into INIT) lands on a
+        # non-executable page → DEP fault on entry, bugcheck 7E with
+        # c0000005 / param0=8.  Restate every attribute INIT needs.
+        # Override the bare ',d' set above (last /SECTION wins).
+        "/SECTION:INIT,ERPD "
+        # clang/lld emits a stray empty .retplne section (retpoline metadata)
+        # with zero characteristics; fold it into .rdata so the kernel image
+        # loader doesn't choke on it.
+        "/MERGE:.retplne=.rdata "
+        # Force IMAGE_SCN_MEM_NOT_PAGED on driver sections.  MSVC's /DRIVER
+        # sets these implicitly; lld-link does not — pageable code/data trips
+        # the kernel image verifier with STATUS_ACCESS_VIOLATION on load.
+        "/SECTION:.text,ERP "  # exec | read | not-paged
+        "/SECTION:.rdata,RP "  # read | not-paged
+        "/SECTION:.data,RWP "  # read | write | not-paged
+        "/SECTION:.pdata,RP "  # read | not-paged (exception unwind)
+        # lld-link sets IMAGE_DLL_CHARACTERISTICS_TERMINAL_SERVER_AWARE by
+        # default; meaningless for a kernel driver and the loader may reject.
+        "/tsaware:no "
+    )
+endif()
+
 # Generate imported targets for WDK lib files
 file(GLOB WDK_LIBRARIES "${WDK_ROOT}/Lib/${WDK_LIB_VERSION}/km/${WDK_PLATFORM}/*.lib")
 foreach(LIBRARY IN LISTS WDK_LIBRARIES)
@@ -210,7 +235,7 @@ unset(WDK_LIBRARIES)
 function(wdk_add_driver _target)
     cmake_parse_arguments(WDK "" "KMDF;WINVER;NTDDI_VERSION" "" ${ARGN})
 
-    add_executable(${_target} ${WDK_UNPARSED_ARGUMENTS})
+    add_executable(${_target} ${WDK_UNPARSED_ARGUMENTS} ${WDK_SECURITY_COOKIE_FILE} ${WDK_MEM_FUNCS_FILE})
 
     set_target_properties(${_target} PROPERTIES SUFFIX ".sys")
     set_target_properties(${_target} PROPERTIES COMPILE_OPTIONS "${WDK_COMPILE_FLAGS}")
