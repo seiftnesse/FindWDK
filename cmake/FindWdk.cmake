@@ -288,6 +288,26 @@ function(wdk_add_driver _target)
             set_property(TARGET ${_target} APPEND_STRING PROPERTY LINK_FLAGS "/ENTRY:GsDriverEntry")
         endif()
     endif()
+
+    # Hard-fail post-build smoke check for clang-cl: scan the .sys for any
+    # xmm/ymm/zmm reference and for self-recursion in mem* wrappers.
+    # The -mgeneral-regs-only flag and the wdk_mem_funcs.c override are
+    # the primary defences; this check catches anything that still slips
+    # through (e.g. a future clang version regressing the flag, or a new
+    # dependency injecting SSE).  The disassembler is looked up next to
+    # the compiler itself, so any LLVM flavour works without hard-coded
+    # install paths.  Skipped silently if no disasm tool is available
+    # (see the script for details).
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        add_custom_command(TARGET ${_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DSYS_FILE=$<TARGET_FILE:${_target}>"
+                "-DC_COMPILER=${CMAKE_C_COMPILER}"
+                -P "${_WDK_FINDWDK_DIR}/wdk_smoke_check_no_sse.cmake"
+            COMMENT "wdk smoke-check: no xmm/ymm/zmm in ${_target}"
+            VERBATIM
+        )
+    endif()
 endfunction()
 
 function(wdk_add_library _target)
